@@ -42,8 +42,8 @@ func (c *Coordinator) WorkerRegister(args *RegisterArgs, reply *RegisterReply) e
 
 	reply.WorkerID = c.WorkerNum
 	c.WorkerExited[c.WorkerNum] = false
+	log.Printf("register a new Worker : %v", c.WorkerNum)
 	c.WorkerNum += 1
-
 	return nil
 }
 
@@ -223,7 +223,7 @@ func (c *Coordinator) Done() bool {
 		close(c.TaskQueue)
 		c.closed = true
 	}
-	return c.TaskDone && c.WorkerDone
+	return c.TaskDone
 }
 
 func MapInit(c *Coordinator) {

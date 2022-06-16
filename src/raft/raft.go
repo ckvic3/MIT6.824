@@ -58,8 +58,8 @@ type ApplyMsg struct {
 // a struct to hold information about each log entry.
 //
 type entry struct {
-	term    int
-	command interface{}
+	Term    int
+	Command interface{}
 }
 
 const (
@@ -67,6 +67,22 @@ const (
 	FOLLOWER  = 1
 	CANDIDATE = 2
 )
+
+func intToState(state int) string {
+
+	var ret string
+	switch state {
+	case 0:
+		ret = "LEADER"
+	case 1:
+		ret = "FOLLOWER"
+	case 2:
+		ret = "CANDIDATE"
+	}
+	return ret
+}
+
+var HEART_BEAT_TIME = time.Millisecond * 100
 
 //
 // A Go object implementing a single Raft peer.
@@ -125,6 +141,7 @@ func (rf *Raft) GetState() (int, bool) {
 
 	var term int
 	var isleader bool
+
 	// Your code here (2A).
 	term = rf.currentTerm
 
@@ -133,6 +150,8 @@ func (rf *Raft) GetState() (int, bool) {
 	} else {
 		isleader = false
 	}
+
+	rf.log.Printf("node %v current Term is %v, current state is %v", rf.me, term, intToState(rf.state))
 
 	return term, isleader
 }
@@ -225,30 +244,74 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	if args.Term == rf.currentTerm && rf.state == LEADER {
-		reply.VoteGranted = false
-		reply.Term = rf.currentTerm
-		rf.log.Printf("node %v don't vote to node %v, because state is leader and term same \n", rf.me, args.CandidateId)
+
+	// 无论Term 谁大谁小， 最终返回该节点的原始 Term 即可
+	// 若args.Term 更大或相等，则reply.Term 并不会产生作用
+	// 只有当 args.Term 小于 rf.currentTerm 时， reply.Term 才会产生作用
+	reply.Term = rf.currentTerm
+
+	if args.Term > rf.currentTerm {
+		// 更新 本节点状态
+		rf.currentTerm = args.Term
+		rf.changeState(FOLLOWER)
+		rf.votedFor = args.CandidateId
+		rf.electionTimer.Reset(randomizeTime())
+
+		// 处理 RPC reply
+		reply.VoteGranted = true
+
+		rf.log.Printf("node %v vote to node %v \n", rf.me, args.CandidateId)
 		return
 	}
 
+	// 1、 本节点比请求节点领先
+	// 2、 或本节点已经投票给其他节点, 对于Candidate 先来先服务
 	if args.Term < rf.currentTerm || (args.Term == rf.currentTerm && rf.votedFor != nil && rf.votedFor != args.CandidateId) {
 		reply.VoteGranted = false
-		reply.Term = rf.currentTerm
 		rf.log.Printf("node %v don't vote to node %v, because server has voted or request term smaller than current term \n", rf.me, args.CandidateId)
 		return
 	}
 
-	if args.Term > rf.currentTerm {
+	// paper 5.4.1 Election Restriction
+	// determines which of two logs is more up-to-date
+	// by comparing the index and term of the last entries in the
+	// logs. If the logs have last entries with different terms, then
+	// the log with the later term is more up-to-date. If the logs
+	// end with the same term, then whichever log is longer is
+	// more up-to-date.
+
+	if args.LastLogTerm < rf.logs[len(rf.logs)-1].Term {
+		reply.VoteGranted = false
+		return
+	} else if args.LastLogTerm > rf.logs[len(rf.logs)-1].Term {
+		reply.VoteGranted = true
+
+		rf.votedFor = args.CandidateId
 		rf.currentTerm = args.Term
 		rf.changeState(FOLLOWER)
-		rf.votedFor = args.CandidateId
-		reply.Term = rf.currentTerm
-		reply.VoteGranted = true
 		rf.electionTimer.Reset(randomizeTime())
-		rf.log.Printf("node %v vote to node %v \n", rf.me, args.CandidateId)
 		return
+	} else {
+		if args.LastLogIndex < len(rf.logs) {
+			reply.VoteGranted = false
+			return
+		} else if args.LastLogIndex >= len(rf.logs) {
+			reply.VoteGranted = true
+			rf.votedFor = args.CandidateId
+			rf.currentTerm = args.Term
+			rf.changeState(FOLLOWER)
+			rf.electionTimer.Reset(randomizeTime())
+			return
+		}
 	}
+
+	// 剩下的就是二者 Term 相同，但本节点还未投票. 这种情况发生的概率？
+	rf.log.Printf("Term equal, but node has't vote! \n")
+	reply.VoteGranted = true
+	rf.changeState(FOLLOWER)
+	rf.electionTimer.Reset(randomizeTime())
+	rf.votedFor = args.CandidateId
+	return
 }
 
 //
@@ -286,11 +349,11 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 }
 
 type AppendEntriesArgs struct {
-	Term     int
-	LeaderId int
-	// PrevLogTerm int
-	// Entries      []entry
-	// LeaderCommit int // leader’s commitIndex
+	Term         int
+	LeaderId     int
+	PrevLogTerm  int
+	Entry        entry
+	LeaderCommit int // leader’s commitIndex
 }
 
 type AppendEntriesReply struct {
@@ -307,16 +370,16 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// 当LEADER 收到 heart beat时
 	if rf.state == LEADER {
-		// 1、该服务器重新上线，
+		// 这种情况发生于，old LEADER 失联后 重新连接。此时会出现两个LEADER
+		// 比较二者间log 序列号
+		reply.Term = rf.currentTerm
 		if rf.currentTerm < args.Term {
 			reply.Success = true
 			reply.Term = rf.currentTerm
-			rf.currentTerm = args.Term
 			rf.changeState(FOLLOWER)
 			rf.electionTimer.Reset(randomizeTime())
 		} else {
 			reply.Success = false
-			reply.Term = rf.currentTerm
 		}
 		return
 	}
@@ -361,6 +424,21 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	// Your code here (2B).
 
+	rf.mu.Lock()
+	if rf.state != LEADER {
+		isLeader = false
+	} else {
+		rf.logs = append(rf.logs, &entry{Term: rf.currentTerm, Command: command})
+		index = len(rf.logs)
+
+		// 异步操作,并不会阻塞
+		rf.sendLogEntries()
+
+		isLeader = true
+		term = rf.currentTerm
+	}
+	rf.mu.Unlock()
+
 	return index, term, isLeader
 }
 
@@ -395,7 +473,7 @@ func (rf *Raft) election() {
 		args.LastLogTerm = 0
 	} else {
 		args.LastLogIndex = len(rf.logs) - 1
-		args.LastLogTerm = rf.logs[len(rf.logs)-1].term
+		args.LastLogTerm = rf.logs[len(rf.logs)-1].Term
 	}
 
 	receiveVoteNum := 1
@@ -415,8 +493,9 @@ func (rf *Raft) election() {
 					if receiveVoteNum > len(rf.peers)/2 && rf.state == CANDIDATE {
 						rf.log.Printf("server %v is LEADER \n", rf.me)
 						rf.changeState(LEADER)
+						// 获得选举胜利后立即发送 heart beat
 						rf.HeartBeat()
-						rf.heartBeatTimer.Reset(50 * time.Millisecond)
+						rf.heartBeatTimer.Reset(HEART_BEAT_TIME)
 					}
 				} else if reply.Term > rf.currentTerm {
 					rf.changeState(FOLLOWER)
@@ -466,6 +545,7 @@ func (rf *Raft) ticker() {
 
 func (rf *Raft) HeartBeat() {
 	for rf.killed() == false {
+
 		if rf.state == LEADER {
 
 			rf.log.Printf("node %v send heart beat to others \n", rf.me)
@@ -478,21 +558,71 @@ func (rf *Raft) HeartBeat() {
 				}
 				go func(index int) {
 					reply := AppendEntriesReply{}
-					rf.sendAppendEntries(index, &args, &reply)
-					rf.mu.Lock()
-					if reply.Term > rf.currentTerm {
-						rf.currentTerm = reply.Term
-						rf.changeState(FOLLOWER)
+
+					if rf.sendAppendEntries(index, &args, &reply) {
+						rf.mu.Lock()
+						if rf.currentTerm != args.Term {
+							rf.log.Printf("node %v Term has changed after send headbeat \n", rf.me)
+						}
+						if reply.Term > rf.currentTerm {
+							rf.currentTerm = reply.Term
+							rf.changeState(FOLLOWER)
+						}
+						rf.mu.Unlock()
+					} else {
+						rf.log.Printf("node %v send heart beat to node %v failed \n", rf.me, index)
 					}
-					rf.mu.Unlock()
+
 				}(i)
 
 			}
-			rf.heartBeatTimer.Reset(50 * time.Millisecond)
+			rf.heartBeatTimer.Reset(HEART_BEAT_TIME)
 		}
 		return
 	}
 
+}
+
+func (rf *Raft) sendLogEntries() {
+
+	for rf.killed() == false {
+
+		for i := 0; i < len(rf.peers); i++ {
+			if rf.me == i {
+				continue
+			} else {
+				go func(index int) {
+
+					if len(rf.logs) > rf.nextIndex[index] {
+
+						args := AppendEntriesArgs{Term: rf.currentTerm,
+							LeaderId:     rf.me,
+							PrevLogTerm:  rf.logs[rf.nextIndex[index]-1].Term,
+							Entry:        *rf.logs[rf.nextIndex[index]],
+							LeaderCommit: rf.commitIndex}
+						reply := AppendEntriesReply{}
+
+						if rf.sendAppendEntries(index, &args, &reply) {
+
+							rf.mu.Lock()
+							if reply.Success {
+								rf.nextIndex[index] += 1
+							} else if reply.Success == false && reply.Term > rf.currentTerm {
+								rf.currentTerm = reply.Term
+								rf.changeState(FOLLOWER)
+								rf.electionTimer.Reset(randomizeTime())
+							}
+							rf.mu.Unlock()
+						}
+					}
+				}(i)
+
+			}
+		}
+		rf.heartBeatTimer.Reset(HEART_BEAT_TIME)
+		return
+
+	}
 }
 
 //
@@ -531,7 +661,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.matchIndex = make([]int, len(rf.peers))
 
 	rf.electionTimer = time.NewTimer(randomizeTime())
-	rf.heartBeatTimer = time.NewTimer(50 * time.Millisecond)
+	rf.heartBeatTimer = time.NewTimer(HEART_BEAT_TIME)
 
 	for i := 0; i < len(rf.peers); i++ {
 		rf.nextIndex[i] = 0
@@ -559,7 +689,7 @@ func (rf *Raft) changeState(state int) {
 
 func randomizeTime() time.Duration {
 
-	ElectionTimeout := 150 * time.Millisecond
+	ElectionTimeout := 300 * time.Millisecond
 	r := time.Duration(rand.Int63()) % ElectionTimeout
 
 	return r + ElectionTimeout
